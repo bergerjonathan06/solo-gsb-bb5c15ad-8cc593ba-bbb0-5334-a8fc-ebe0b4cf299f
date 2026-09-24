@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from . import consensus as consensus_mod
 from . import db, ingest, review_groups
 from .config import Settings, get_settings
 from .matcher import candidate_to_dict, match_address, result_to_dict
@@ -209,6 +210,26 @@ def _persist_match(conn: db.sqlite3.Connection, result: Any) -> int:
     )
 
 
+def _apply_review_consensus(result: Any,
+                            evidence_map: dict[str, Any],
+                            valid_address_ids: set[int]) -> None:
+    """Attach (and possibly apply) review consensus to one scored result.
+
+    Scoring itself is untouched; only ``needs_review`` results consult the
+    consensus memory of already-reviewed records under the same normalised
+    road/locality tokens + house number.
+    """
+    if result.status != "needs_review":
+        return
+    key = consensus_mod.key_from_normalized(result.normalized_query)
+    verdict = consensus_mod.consensus_for_key(
+        evidence_map, key, valid_address_ids
+    )
+    extra = consensus_mod.apply_consensus(result, verdict)
+    if extra:
+        result.consensus = extra["consensus"]
+
+
 @app.post("/api/match")
 def api_match(payload: MatchRequest,
               conn: db.sqlite3.Connection = Depends(get_conn),
@@ -216,6 +237,9 @@ def api_match(payload: MatchRequest,
     if db.count_addresses(conn) == 0:
         raise HTTPException(status_code=400, detail="标准地址表为空，请先上传或加载示例数据")
     result = match_address(payload.query, db.all_addresses(conn), settings)
+    evidence_map = consensus_mod.load_evidence_map(conn)
+    valid_address_ids = {r["id"] for r in conn.execute("SELECT id FROM addresses")}
+    _apply_review_consensus(result, evidence_map, valid_address_ids)
     data = result_to_dict(result)
     if payload.save:
         with db.transaction(conn):
@@ -230,10 +254,15 @@ def api_match_batch(payload: BatchMatchRequest,
     if db.count_addresses(conn) == 0:
         raise HTTPException(status_code=400, detail="标准地址表为空，请先上传或加载示例数据")
     rows = db.all_addresses(conn)
+    # One evidence snapshot for the whole batch so all queries see the same
+    # reviewed history.
+    evidence_map = consensus_mod.load_evidence_map(conn)
+    valid_address_ids = {r["id"] for r in conn.execute("SELECT id FROM addresses")}
     items = []
     with db.transaction(conn):
         for query in payload.queries:
             result = match_address(query, rows, settings)
+            _apply_review_consensus(result, evidence_map, valid_address_ids)
             data = result_to_dict(result)
             if payload.save:
                 data["match_id"] = _persist_match(conn, result)
@@ -243,6 +272,9 @@ def api_match_batch(payload: BatchMatchRequest,
         "auto_matched": sum(1 for i in items if i["status"] == "auto_matched"),
         "needs_review": sum(1 for i in items if i["status"] == "needs_review"),
         "no_match": sum(1 for i in items if i["status"] == "no_match"),
+        "consensus_matched": sum(
+            1 for i in items if (i.get("consensus") or {}).get("hit") is not None
+        ),
     }
     return {"summary": summary, "results": items}
 

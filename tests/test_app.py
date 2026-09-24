@@ -528,3 +528,199 @@ def test_review_groups_split_when_candidates_differ(client):
     assert r.status_code == 200
     assert r.json()["reviewed"] == 1
     assert client.get(f"/api/matches/{first_id}").json()["status"] == "reviewed"
+
+
+# --------------------------------------------- review-consensus memory --
+
+
+def _add_standard(client, external_id: str, address: str, *,
+                  city: str = "Consensuston", state: str = "NJ",
+                  postal_code: str = "70001") -> int:
+    r = client.post("/api/addresses", json={"addresses": [{
+        "external_id": external_id, "address": address,
+        "city": city, "state": state, "postal_code": postal_code,
+    }]})
+    assert r.status_code == 200, r.text
+    assert r.json()["inserted"] == 1, r.json()
+    listing = client.get("/api/addresses?limit=500").json()["items"]
+    return next(a["id"] for a in listing if a["external_id"] == external_id)
+
+
+def _review(client, match_id: int, action: str, selected_id: int | None = None):
+    body = {"action": action}
+    if selected_id is not None:
+        body["selected_id"] = selected_id
+    r = client.post(f"/api/matches/{match_id}/review", json=body)
+    assert r.status_code == 200, r.text
+
+
+def _match_saved(client, query: str) -> dict:
+    r = client.post("/api/match", json={"query": query})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_consensus_auto_repoints_after_two_confirmations(client):
+    # Two standards on the same street; queries with a *different* house number
+    # always stay below the auto threshold and need review.
+    beacon1 = _add_standard(client, "CN-B1", "1 Beacon Court")
+    beacon2 = _add_standard(client, "CN-B2", "3 Beacon Court")
+
+    q1 = "7 Beacon Court, Consensuston, NJ 70001"
+    q2 = "7 Beacon Ct, Consensuston, NJ 70001"
+    q3 = "#7 Beacon Ct., Consensuston NJ 70001"
+
+    first = _match_saved(client, q1)
+    second = _match_saved(client, q2)
+    assert first["status"] == "needs_review"
+    assert second["status"] == "needs_review"
+    # no reviewed history yet -> no consensus payload at all
+    assert first["consensus"] is None
+
+    # Reviewers override both earlier cases to the SAME target (beacon1).
+    _review(client, first["match_id"], "overridden", beacon1)
+    _review(client, second["match_id"], "overridden", beacon1)
+
+    # A new, differently-written query normalising to the same road/locality
+    # tokens + house number is now auto-re-pointed by the consensus memory.
+    third = _match_saved(client, q3)
+    assert third["status"] == "auto_matched"
+    assert third["best_id"] == beacon1
+    cons = third["consensus"]
+    assert cons["hit"] == beacon1
+    assert cons["evidence_count"] == 2
+    assert set(cons["evidence_match_ids"]) == {first["match_id"], second["match_id"]}
+    # the consensus target is presented as the first candidate
+    assert third["candidates"][0]["address"]["id"] == beacon1
+    assert beacon1 != second["best_id"]  # scoring itself had ranked beacon2 first
+
+    # New reviews take effect immediately, but old records were not rewritten.
+    old = client.get(f"/api/matches/{first['match_id']}").json()
+    assert old["status"] == "reviewed"
+    assert old["selected_id"] == beacon1
+
+
+def test_consensus_conflict_on_rejection_keeps_original(client):
+    maple1 = _add_standard(client, "CN-M1", "30 Maple Drive",
+                          city="Mapleton", postal_code="60126")
+    maple2 = _add_standard(client, "CN-M2", "40 Maple Drive",
+                          city="Mapleton", postal_code="60126")
+
+    id_a = _match_saved(client, "35 Maple Drive, Mapleton, IL 60126")["match_id"]
+    id_b = _match_saved(client, "35 Maple Dr, Mapleton, IL 60126")["match_id"]
+    # one confirmation, one rejection -> history is not unanimous
+    _review(client, id_a, "overridden", maple1)
+    _review(client, id_b, "rejected")
+
+    data = _match_saved(client, "35 MAPLE DRIVE, Mapleton, IL 60126")
+    assert data["status"] == "needs_review"  # original judgment kept
+    cons = data["consensus"]
+    assert cons["hit"] is None
+    assert "拒绝" in cons["reason"]
+    assert cons["reviewed_count"] == 2
+    # neither historical record was rewritten
+    assert client.get(f"/api/matches/{id_b}").json()["review_action"] == "rejected"
+    assert maple2 is not None
+
+
+def test_consensus_conflict_on_different_targets(client):
+    aspen1 = _add_standard(client, "CN-A1", "10 Aspen Way")
+    aspen2 = _add_standard(client, "CN-A2", "20 Aspen Way")
+
+    id_a = _match_saved(client, "15 Aspen Way, Consensuston, NJ 70001")["match_id"]
+    id_b = _match_saved(client, "no. 15 Aspen Way, Consensuston, NJ 70001")["match_id"]
+    _review(client, id_a, "overridden", aspen1)
+    _review(client, id_b, "overridden", aspen2)
+
+    data = _match_saved(client, "15 ASPEN WAY, CONSENSUSTON, NJ 70001")
+    assert data["status"] == "needs_review"
+    cons = data["consensus"]
+    assert cons["hit"] is None
+    assert "冲突" in cons["reason"]
+
+
+def test_consensus_needs_two_evidences(client):
+    cedar = _add_standard(client, "CN-SO1", "14 Cedar Lane",
+                          city="Oaktown", postal_code="60126")
+
+    only = _match_saved(client, "18 Cedar Lane, Oaktown, IL 60126")
+    assert only["status"] == "needs_review"
+    _review(client, only["match_id"], "overridden", cedar)
+
+    # only one reviewed record -> below the two-evidence bar, stays pending
+    data = _match_saved(client, "18 Cedar Ln, Oaktown, IL 60126")
+    assert data["status"] == "needs_review"
+    cons = data["consensus"]
+    assert cons["hit"] is None
+    assert cons["reviewed_count"] == 1
+    assert "1 条" in cons["reason"]
+
+
+def test_consensus_target_missing_from_candidates_keeps_original(client):
+    # The consensus target carries extra street words ("Grand Old") so its
+    # token F1 against the query is lower than exact competitors; once five
+    # better candidates exist, the target drops out of the top-5 candidate
+    # list even though its house number matches best.
+    target = _add_standard(client, "CN-T", "12 Grand Old Birch Road",
+                           city="Riverton", postal_code="61000")
+    pending = _match_saved(client, "10 Birch Road, Riverton, IL 61000")
+    assert pending["status"] == "needs_review"
+    assert pending["best_id"] == target
+    id_a = pending["match_id"]
+    id_b = _match_saved(client, "No. 10 Birch Road, Riverton, IL 61000")["match_id"]
+    assert id_a != id_b
+    _review(client, id_a, "overridden", target)
+    _review(client, id_b, "overridden", target)
+
+    for i, house in enumerate(["11", "9", "8", "13", "12"]):
+        _add_standard(client, f"CN-C{i}", f"{house} Birch Road",
+                      city="Riverton", postal_code="61000")
+
+    data = _match_saved(client, "10 Birch Rd, Riverton, IL 61000")
+    # every competitor outscores the consensus target but stays below the
+    # auto threshold (wrong house numbers) -> original judgment still pending
+    assert data["status"] == "needs_review"
+    candidate_ids = [c["address"]["id"] for c in data["candidates"]]
+    assert target not in candidate_ids
+    assert len(candidate_ids) == 5
+    cons = data["consensus"]
+    assert cons["hit"] is None
+    assert cons["evidence_count"] == 2
+    assert "不在本次" in cons["reason"]
+
+
+def test_consensus_does_not_apply_to_no_match(client):
+    # Unit-level guard: consensus never overrides a no_match / auto_matched
+    # judgment, only pending ones.
+    from app.consensus import apply_consensus
+
+    class Dummy:
+        status = "no_match"
+
+    assert apply_consensus(Dummy(), {"hit": 1, "reason": "x"}) == {}
+
+
+def test_consensus_in_batch_summary(client):
+    harbor1 = _add_standard(client, "CN-H1", "2 Harbor Court",
+                            city="Harborton", state="ME", postal_code="40010")
+    harbor2 = _add_standard(client, "CN-H2", "4 Harbor Court",
+                            city="Harborton", state="ME", postal_code="40010")
+    id_a = _match_saved(client, "3 Harbor Court, Harborton, ME 40010")["match_id"]
+    id_b = _match_saved(client, "3 Harbor Ct, Harborton, ME 40010")["match_id"]
+    _review(client, id_a, "overridden", harbor1)
+    _review(client, id_b, "overridden", harbor1)
+
+    r = client.post("/api/match/batch", json={"queries": [
+        "3 HARBOR COURT, HARBORTON, ME 40010",
+        "1 Milky Way, Mars Base",
+    ]})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["summary"]["consensus_matched"] == 1
+    consensus_hit = next(
+        i for i in data["results"] if (i.get("consensus") or {}).get("hit") is not None
+    )
+    assert consensus_hit["status"] == "auto_matched"
+    assert consensus_hit["best_id"] == harbor1
+    assert consensus_hit["consensus"]["evidence_count"] == 2
+    assert harbor2 is not None

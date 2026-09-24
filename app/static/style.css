@@ -160,6 +160,26 @@ button.reject { background: var(--red-bg); color: var(--red); }
 }
 .conflict b { color: var(--red); }
 
+/* review-consensus memory */
+.consensus {
+    font-size: 12px; padding: 7px 10px; border-radius: 0 6px 6px 0;
+    margin: 8px 0 4px; border-left-width: 3px; border-left-style: solid;
+}
+.consensus.hit {
+    background: var(--green-bg); color: var(--green);
+    border-left-color: var(--green);
+}
+.consensus.miss {
+    background: var(--gray-bg); color: var(--muted);
+    border-left-color: var(--muted);
+}
+.consensus-badge {
+    display: inline-block; font-weight: 700; margin-right: 6px;
+    padding: 1px 8px; border-radius: 999px; font-size: 11px;
+}
+.consensus-badge.hit { background: var(--green); color: #fff; }
+.consensus-badge.miss { background: var(--muted); color: #fff; }
+
 .table-wrap { overflow-x: auto; margin-top: 8px; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }

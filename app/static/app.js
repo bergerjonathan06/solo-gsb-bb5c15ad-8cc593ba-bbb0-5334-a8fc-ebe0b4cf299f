@@ -91,6 +91,26 @@ function renderConflicts(conflicts) {
         </div>`).join("");
 }
 
+function renderConsensus(consensus) {
+    if (!consensus || !consensus.reason) return "";
+    const evidence = consensus.evidence_count || 0;
+    const ids = (consensus.evidence_match_ids || []).join(", ");
+    if (consensus.hit !== null && consensus.hit !== undefined) {
+        return `
+        <div class="consensus hit">
+            <span class="consensus-badge hit">复核共识命中</span>
+            ${escapeHtml(consensus.reason)}
+            <span class="muted">（证据 ${evidence} 条 · 记录 #${escapeHtml(ids)}）</span>
+        </div>`;
+    }
+    return `
+    <div class="consensus miss">
+        <span class="consensus-badge miss">复核共识未采用</span>
+        ${escapeHtml(consensus.reason)}
+        ${consensus.reviewed_count ? `<span class="muted">（历史已复核 ${consensus.reviewed_count} 条）</span>` : ""}
+    </div>`;
+}
+
 function renderCandidate(cand, rank, opts = {}) {
     const a = cand.address;
     const bestCls = rank === 0 ? " best" : "";
@@ -134,6 +154,7 @@ function renderResult(item, opts = {}) {
         </div>
         <span class="status ${item.status}">${STATUS_LABEL[item.status] || item.status}</span>
         <span class="muted">${escapeHtml(item.reason)}</span>
+        ${renderConsensus(item.consensus)}
         ${item.runner_up_id ? `<div class="muted" style="margin-top:4px">次高分候选 #${item.runner_up_id}：${pct(item.runner_up_score)}（领先 ${pct((item.best_score ?? 0) - (item.runner_up_score ?? 0))}）</div>` : ""}
         ${candidates || '<div class="meta muted">标准地址表中没有任何候选</div>'}
         ${opts.reviewable && item.candidates.length > 0 ? `
@@ -184,7 +205,8 @@ $("#btn-match").addEventListener("click", async () => {
             });
             const s = data.summary;
             $("#match-summary").innerHTML =
-                `<span class="muted">共 ${s.total} 条：自动命中 ${s.auto_matched}，` +
+                `<span class="muted">共 ${s.total} 条：自动命中 ${s.auto_matched}` +
+                `${s.consensus_matched ? `（其中复核共识 ${s.consensus_matched} 条）` : ""}，` +
                 `待确认 ${s.needs_review}，无匹配 ${s.no_match}</span>`;
             $("#results").innerHTML = data.results
                 .map((item) => renderResult(item, { reviewable: item.status === "needs_review" }))

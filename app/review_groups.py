@@ -21,7 +21,7 @@ import sqlite3
 from typing import Any
 
 from . import db
-from .normalization import normalize
+from .consensus import norm_key as _norm_key
 
 
 class GroupReviewError(Exception):
@@ -32,14 +32,13 @@ class GroupConflict(GroupReviewError):
     """The group changed since the client loaded it; nothing was written."""
 
 
-def _norm_key(query: str) -> dict[str, Any]:
-    """Canonical grouping key: normalised road/locality tokens + house number."""
-    n = normalize(query)
-    return {
-        "street": sorted(n.street_tokens),
-        "locality": sorted(n.locality_tokens),
-        "house": n.house or "",
-    }
+def _norm_key_from_query(query: str) -> dict[str, Any]:
+    """Canonical grouping key: normalised road/locality tokens + house number.
+
+    Shared with the review-consensus memory (``app/consensus.py``) so both
+    features group by exactly the same normalised form.
+    """
+    return _norm_key(query)
 
 
 def _candidate_signature(candidates: list[dict[str, Any]]) -> list[list[Any]]:
@@ -64,7 +63,7 @@ def compute_groups(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     buckets: dict[str, dict[str, Any]] = {}
     for row in rows:
         candidates = json.loads(row["candidates_json"])
-        norm_key = _norm_key(row["query"])
+        norm_key = _norm_key_from_query(row["query"])
         key = _group_key(norm_key, _candidate_signature(candidates))
         bucket = buckets.get(key)
         if bucket is None:
