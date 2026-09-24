@@ -91,15 +91,51 @@ function renderConflicts(conflicts) {
         </div>`).join("");
 }
 
+const CONSENSUS_STATE_HINT = {
+    hit: "共识命中",
+    conflict: "历史结论冲突",
+    target_gone: "共识地址已失效",
+    not_candidate: "共识地址不在候选",
+    not_applied: "共识未改写原判",
+    insufficient: "",
+};
+
+function renderConsensus(consensus) {
+    if (!consensus) return "";
+    const n = consensus.evidence_count || 0;
+    const targetText = consensus.target
+        ? `标准地址 #${consensus.target.id} ${escapeHtml(consensus.target.full_text || "")}`
+        : (consensus.target_id ? `标准地址 #${consensus.target_id}` : "");
+    if (consensus.applied) {
+        return `
+        <div class="consensus hit">
+            <span class="consensus-badge">✅ 复核共识命中</span>
+            <span class="consensus-meta">证据 <b>${n}</b> 条已复核记录一致确认 → ${targetText}</span>
+            <div class="consensus-reason">${escapeHtml(consensus.reason || "")}</div>
+        </div>`;
+    }
+    const label = CONSENSUS_STATE_HINT[consensus.state];
+    if (!label) return "";
+    return `
+    <div class="consensus blocked">
+        <span class="consensus-badge">⛔ ${escapeHtml(label)}</span>
+        <span class="consensus-meta">证据 <b>${n}</b> 条${consensus.rejected_count ? `，拒绝 <b>${consensus.rejected_count}</b> 条` : ""}，至少需 <b>${consensus.required || 2}</b> 条同向确认</span>
+        <div class="consensus-reason">${escapeHtml(consensus.reason || "")}</div>
+    </div>`;
+}
+
 function renderCandidate(cand, rank, opts = {}) {
     const a = cand.address;
     const bestCls = rank === 0 ? " best" : "";
     const actionAttrs = opts.reviewable
         ? `data-log="${opts.logId}" data-address="${a.id}"`
         : "";
+    const ribbon = opts.consensusTargetId === a.id
+        ? `<span class="target-ribbon">共识指向</span>`
+        : "";
     return `
     <div class="candidate${bestCls}">
-        <div class="addr">#${rank + 1} ${escapeHtml(a.full_text)}</div>
+        <div class="addr">#${rank + 1} ${escapeHtml(a.full_text)} ${ribbon}</div>
         <div class="meta">
             标准地址 ID ${a.id}${a.external_id ? ` · 外部编号 ${escapeHtml(a.external_id)}` : ""}
             ${a.house ? ` · 门牌号 ${escapeHtml(a.house)}` : ""}
@@ -121,8 +157,11 @@ function renderCandidate(cand, rank, opts = {}) {
 }
 
 function renderResult(item, opts = {}) {
+    const consensusTargetId = item.consensus && item.consensus.applied
+        ? item.consensus.target_id
+        : null;
     const candidates = (item.candidates || [])
-        .map((c, i) => renderCandidate(c, i, opts))
+        .map((c, i) => renderCandidate(c, i, { ...opts, consensusTargetId }))
         .join("");
     return `
     <div class="result">
@@ -134,6 +173,7 @@ function renderResult(item, opts = {}) {
         </div>
         <span class="status ${item.status}">${STATUS_LABEL[item.status] || item.status}</span>
         <span class="muted">${escapeHtml(item.reason)}</span>
+        ${renderConsensus(item.consensus)}
         ${item.runner_up_id ? `<div class="muted" style="margin-top:4px">次高分候选 #${item.runner_up_id}：${pct(item.runner_up_score)}（领先 ${pct((item.best_score ?? 0) - (item.runner_up_score ?? 0))}）</div>` : ""}
         ${candidates || '<div class="meta muted">标准地址表中没有任何候选</div>'}
         ${opts.reviewable && item.candidates.length > 0 ? `
@@ -447,10 +487,14 @@ async function loadReview() {
         }
         list.innerHTML = data.items.map((item) => {
             const best = item.candidates[0];
+            const consensusTargetId = item.consensus && item.consensus.applied
+                ? item.consensus.target_id
+                : null;
             const candidateHtml = item.candidates.length
                 ? item.candidates.map((c, i) => renderCandidate(c, i, {
                     reviewable: item.status === "needs_review",
                     logId: item.id,
+                    consensusTargetId,
                 })).join("")
                 : '<div class="meta muted">无候选</div>';
             return `
@@ -459,6 +503,7 @@ async function loadReview() {
                 <div class="muted">记录 #${item.id} · ${escapeHtml(item.created_at || "")}</div>
                 <span class="status ${item.status}">${STATUS_LABEL[item.status] || item.status}</span>
                 ${item.review_action ? `<span class="muted">复核动作：${escapeHtml(item.review_action)}</span>` : ""}
+                ${renderConsensus(item.consensus)}
                 ${candidateHtml}
                 ${item.status === "needs_review" ? `
                 <div class="review-actions">

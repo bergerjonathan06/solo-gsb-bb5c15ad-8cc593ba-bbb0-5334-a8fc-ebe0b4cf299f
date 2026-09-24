@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import db, ingest, review_groups
+from . import consensus, db, ingest, review_groups
 from .config import Settings, get_settings
 from .matcher import candidate_to_dict, match_address, result_to_dict
 from .schemas import (
@@ -206,6 +206,7 @@ def _persist_match(conn: db.sqlite3.Connection, result: Any) -> int:
         ),
         conflicts=best.conflicts if best else [],
         candidates=[candidate_to_dict(c) for c in result.candidates],
+        consensus=result.consensus,
     )
 
 
@@ -216,6 +217,10 @@ def api_match(payload: MatchRequest,
     if db.count_addresses(conn) == 0:
         raise HTTPException(status_code=400, detail="标准地址表为空，请先上传或加载示例数据")
     result = match_address(payload.query, db.all_addresses(conn), settings)
+    # Scoring is unchanged; the reviewed-record consensus may redirect a
+    # would-be needs_review result to an already-vouched standard address.
+    verdict = consensus.lookup_consensus(conn, payload.query)
+    consensus.apply_consensus(result, verdict)
     data = result_to_dict(result)
     if payload.save:
         with db.transaction(conn):
@@ -234,6 +239,8 @@ def api_match_batch(payload: BatchMatchRequest,
     with db.transaction(conn):
         for query in payload.queries:
             result = match_address(query, rows, settings)
+            verdict = consensus.lookup_consensus(conn, query)
+            consensus.apply_consensus(result, verdict)
             data = result_to_dict(result)
             if payload.save:
                 data["match_id"] = _persist_match(conn, result)
@@ -264,6 +271,7 @@ def _serialize_log(row: db.sqlite3.Row) -> dict[str, Any]:
         "matched_tokens": json.loads(row["matched_tokens"] or "[]"),
         "conflicts": json.loads(row["conflicts"] or "[]"),
         "candidates": json.loads(row["candidates_json"]),
+        "consensus": json.loads(row["consensus_json"]) if row["consensus_json"] else None,
         "created_at": row["created_at"],
         "reviewed_at": row["reviewed_at"],
     }

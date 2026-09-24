@@ -245,6 +245,9 @@ class MatchResult:
     runner_up: CandidateResult | None
     candidates: list[CandidateResult]
     thresholds: dict[str, float]
+    # Populated by app/consensus.py from the reviewed-record memory; scoring
+    # itself never touches this.
+    consensus: dict[str, Any] | None = None
 
 
 def _candidate_address(row: Any) -> dict[str, Any]:
@@ -421,4 +424,5 @@ def result_to_dict(result: MatchResult) -> dict[str, Any]:
         "runner_up_score": result.runner_up.score if result.runner_up else None,
         "thresholds": result.thresholds,
         "candidates": [candidate_to_dict(c) for c in result.candidates],
+        "consensus": result.consensus,
     }

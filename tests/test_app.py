@@ -528,3 +528,228 @@ def test_review_groups_split_when_candidates_differ(client):
     assert r.status_code == 200
     assert r.json()["reviewed"] == 1
     assert client.get(f"/api/matches/{first_id}").json()["status"] == "reviewed"
+
+
+# ------------------------------------------------- review consensus memory
+
+
+def _seed_two_confirms(client, query_a: str, query_b: str) -> int:
+    """Review two different spellings of the same case, both -> best candidate."""
+    ids = []
+    target_id = None
+    for q in (query_a, query_b):
+        r = client.post("/api/match", json={"query": q})
+        data = r.json()
+        assert data["status"] == "needs_review", data
+        ids.append(data["match_id"])
+        target_id = data["best_id"]
+    for mid in ids:
+        r = client.post(f"/api/matches/{mid}/review", json={"action": "confirmed"})
+        assert r.status_code == 200
+    assert target_id is not None
+    return target_id
+
+
+def test_consensus_auto_applies_after_two_confirms(client):
+    # Two spelling variants normalise to the same road/locality/house key and
+    # are both human-confirmed; the third variant is resolved automatically.
+    target = _seed_two_confirms(
+        client, "1010 Lake Dr, Austin TX", "No. 1010 Lake Drive, Austin TX"
+    )
+
+    r = client.post("/api/match", json={"query": "1010 LAKE DR, AUSTIN TX"})
+    data = r.json()
+    assert data["status"] == "auto_matched"
+    assert data["best_id"] == target
+    con = data["consensus"]
+    assert con["state"] == "hit"
+    assert con["applied"] is True
+    assert con["target_id"] == target
+    assert con["evidence_count"] >= 2
+    assert con["rejected_count"] == 0
+    # the original scoring verdict is preserved inside the consensus block
+    assert con["original_status"] == "needs_review"
+
+    # it is persisted as auto_matched with the consensus verdict attached
+    detail = client.get(f"/api/matches/{data['match_id']}").json()
+    assert detail["status"] == "auto_matched"
+    assert detail["consensus"]["applied"] is True
+    assert detail["consensus"]["target_id"] == target
+
+
+def test_consensus_single_record_is_insufficient(client):
+    mid = _match_pending(client, "1011 Lake Dr, Austin TX")
+    client.post(f"/api/matches/{mid}/review", json={"action": "confirmed"})
+
+    data = client.post("/api/match", json={"query": "1011 Lake Dr, Austin TX"}).json()
+    assert data["status"] == "needs_review"
+    con = data["consensus"]
+    assert con["state"] == "insufficient"
+    assert con["applied"] is False
+    assert con["evidence_count"] == 1
+
+
+def test_consensus_blocked_by_rejection(client):
+    mid_yes = _match_pending(client, "1012 Lake Dr, Austin TX")
+    client.post(f"/api/matches/{mid_yes}/review", json={"action": "confirmed"})
+    mid_no = _match_pending(client, "No. 1012 Lake Dr, Austin TX")
+    client.post(f"/api/matches/{mid_no}/review", json={"action": "rejected"})
+
+    data = client.post("/api/match", json={"query": "1012 LAKE DR, AUSTIN TX"}).json()
+    # one rejection poisons the bucket even with another confirmation present
+    assert data["status"] == "needs_review"
+    con = data["consensus"]
+    assert con["state"] == "conflict"
+    assert con["applied"] is False
+    assert con["rejected_count"] == 1
+
+
+def test_consensus_blocked_by_conflicting_targets(client):
+    first = client.post("/api/match", json={"query": "1017 Lake Dr, Austin TX"}).json()
+    target_a = first["best_id"]
+    target_b = first["candidates"][1]["address"]["id"]
+    assert target_a != target_b
+
+    mid_a = first["match_id"]
+    mid_b = client.post("/api/match",
+                        json={"query": "No. 1017 Lake Dr, Austin TX"}).json()["match_id"]
+    client.post(f"/api/matches/{mid_a}/review", json={"action": "confirmed"})
+    client.post(f"/api/matches/{mid_b}/review",
+                json={"action": "overridden", "selected_id": target_b})
+
+    data = client.post("/api/match", json={"query": "1017 LAKE DR, AUSTIN TX"}).json()
+    assert data["status"] == "needs_review"
+    con = data["consensus"]
+    assert con["state"] == "conflict"
+    assert con["applied"] is False
+
+
+def test_consensus_takes_effect_immediately_and_does_not_rewrite(client):
+    mid_a = _match_pending(client, "1014 Lake Dr, Austin TX")
+    mid_b = _match_pending(client, "No. 1014 Lake Dr, Austin TX")
+
+    # before the reviews: not enough evidence, stays pending
+    before = client.post("/api/match", json={"query": "1014 LAKE DR, AUSTIN TX"}).json()
+    assert before["status"] == "needs_review"
+    assert before["consensus"]["state"] == "insufficient"
+
+    client.post(f"/api/matches/{mid_a}/review", json={"action": "confirmed"})
+    # still just one -> insufficient
+    one = client.post("/api/match", json={"query": "1014 Lake Drive, Austin TX"}).json()
+    assert one["consensus"]["state"] == "insufficient"
+
+    client.post(f"/api/matches/{mid_b}/review", json={"action": "confirmed"})
+    # new reviews take effect immediately
+    after = client.post("/api/match", json={"query": "1014 LAKE DR, AUSTIN TX"}).json()
+    assert after["status"] == "auto_matched"
+    assert after["consensus"]["applied"] is True
+
+    # old records are never rewritten
+    for mid in (mid_a, mid_b):
+        old = client.get(f"/api/matches/{mid}").json()
+        assert old["status"] == "reviewed"
+        assert old["review_action"] == "confirmed"
+
+
+def test_consensus_in_batch(client):
+    target = _seed_two_confirms(
+        client, "1018 Lake Dr, Austin TX", "No. 1018 Lake Dr, Austin TX"
+    )
+    r = client.post("/api/match/batch", json={
+        "queries": ["1018 LAKE DR, AUSTIN TX", "zzqxkw marsport 99999"],
+    })
+    consensus_hit, no_match = r.json()["results"]
+    assert consensus_hit["status"] == "auto_matched"
+    assert consensus_hit["best_id"] == target
+    assert consensus_hit["consensus"]["applied"] is True
+    # gibberish verdicts are never redirected by consensus
+    assert no_match["status"] == "no_match"
+    s = r.json()["summary"]
+    assert s["auto_matched"] == 1
+    assert s["no_match"] == 1
+
+
+def test_consensus_target_not_in_candidates_keeps_verdict():
+    # Unanimous history pointing at address #1, while the current match's
+    # candidate list contains different addresses: original verdict stands.
+    from app import consensus as consensus_mod
+    from app.main import get_conn
+    from app.matcher import CandidateResult, MatchResult
+    from app.normalization import Normalized
+
+    conn = get_conn()
+    ver = consensus_mod.lookup_consensus(
+        conn, "123 Main Street, New York, NY 10001"
+    )
+    # No reviews yet for that key: force a unanimous-hit verdict manually and
+    # feed it to apply_consensus with a candidate set that excludes the target.
+    hit = {
+        **ver,
+        "state": "hit",
+        "applied": False,
+        "target_id": 1,
+        "target": {"id": 1, "full_text": "123 Main Street"},
+        "evidence_count": 2,
+        "rejected_count": 0,
+        "reason": "x",
+    }
+    result = MatchResult(
+        query="123 Main Street, New York, NY 10001",
+        normalized_query=Normalized(original="", text=""),
+        status="needs_review",
+        reason="ambiguous",
+        best=None,
+        runner_up=None,
+        candidates=[],
+        thresholds={},
+    )
+    consensus_mod.apply_consensus(result, hit)
+    assert result.status == "needs_review"
+    assert result.consensus["state"] == "not_candidate"
+    assert result.consensus["applied"] is False
+    assert "不在本次候选" in result.consensus["reason"]
+
+
+def test_consensus_target_address_deleted_keeps_verdict():
+    from app import consensus as consensus_mod
+    from app import db
+    from app.main import get_conn
+
+    conn = get_conn()
+    # Insert two reviewed logs for a brand-new normalised key, both pointing
+    # at a throwaway address which is then deleted.
+    address_id = db.insert_address(
+        conn,
+        full_text="88 Consensus Way, Consensus City",
+        tokens=["consensus", "way"],
+        street_tokens=["consensus", "way"],
+        locality_tokens=["consensus", "city"],
+        house="88",
+        fields={},
+        raw={},
+    )
+    for q in ("88 Consensus Way, Consensus City", "No. 88 Consensus Way, Consensus City"):
+        log_id = db.insert_match_log(
+            conn,
+            query=q,
+            status="needs_review",
+            score=0.5,
+            candidate_id=address_id,
+            token_score=0.6,
+            house_score=0.3,
+            matched_tokens=[],
+            conflicts=[],
+            candidates=[],
+        )
+        db.review_match_log(conn, log_id, action="confirmed",
+                            selected_id=address_id, score=0.5)
+    conn.commit()
+    conn.execute("DELETE FROM addresses WHERE id = ?", (address_id,))
+    conn.commit()
+
+    ver = consensus_mod.lookup_consensus(conn, "88 CONSENSUS WAY, CONSENSUS CITY")
+    assert ver["state"] == "target_gone"
+    assert ver["applied"] is False
+    # positive decisions whose target was deleted are counted as stale
+    assert ver["stale_count"] == 2
+    assert ver["evidence_count"] == 0

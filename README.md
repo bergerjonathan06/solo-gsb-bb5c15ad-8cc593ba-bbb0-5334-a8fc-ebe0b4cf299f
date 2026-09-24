@@ -6,11 +6,12 @@
 过小的候选会被标记为 **待确认（needs_review）**，并在界面上展示命中词元、冲突字段与
 可复核结果。
 
-- 🌐 网页界面：单条/批量匹配、上传标准地址 CSV、待确认队列人工复核（含同案合并复核）
+- 🌐 网页界面：单条/批量匹配、上传标准地址 CSV、待确认队列人工复核（含同案合并复核、复核共识记忆）
 - 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、复核接口（含 `/docs` Swagger）
 - 🗄️ SQLite 持久化，零外部依赖，数据通过 Docker volume 保存
 - 🌍 归一化：NFKC + 变音符折叠 + 繁简中文映射 + 全角字符、道路缩写（St/Rd/Ave…）、门牌号（`#12-B`/`No.12b`/`12号`）
 - 👥 同案合并复核：归一化后道路/地区词元与门牌号一致、且候选（ID/顺序/得分）完全相同的待确认记录自动归组，可整组确认首选、改派共同候选或判无匹配；整组写入在单个 SQLite 写事务内完成，组成员或签名有变化即整体冲突回滚
+- 🧠 **复核共识记忆**：单条与批量匹配照常评分；当同一归一化道路词元 + 地区词元 + 门牌号下已有 **至少 2 条已复核记录**、且全部一致确认同一个仍然有效的标准地址（无拒绝、无不同结论）时，新的待确认结果自动指向该地址；目标不在本次候选中或历史结论冲突时保持原判并返回原因。新复核即时生效，旧记录不回写；页面展示共识命中状态与证据条数
 
 ---
 
@@ -206,6 +207,53 @@ curl -s -X POST http://localhost:8000/api/review-groups/review \
        "action": "confirmed"}'
 ```
 
+7. **复核共识记忆**（`app/consensus.py`）
+
+   评分逻辑完全不变；每次匹配（`/api/match` 与 `/api/match/batch`）评分后，
+   都会实时查询该查询 **归一化道路词元 + 地区词元 + 门牌号** 下的已复核历史：
+
+   - **形成共识（hit）**：至少 **2 条** 已复核记录（`confirmed` /
+     `overridden`），且全部指向 **同一个仍然存在的标准地址** ——
+     不能有任何一条 `rejected`，也不能有指向其他地址的不同结论；
+   - **自动指向**：仅当本次结果原本为 **待确认**、且共识地址在本次候选中时，
+     才把结果改为 `auto_matched` 并指向共识地址（候选原得分保持不变）；
+     `auto_matched` / `no_match` 的评分原判不会被改写；
+   - **保持原判并返回原因**：
+     - 证据不足（`insufficient`，同向记录 < 2）；
+     - 历史结论冲突（`conflict`，存在拒绝结论，或确认了不同地址）；
+     - 共识地址已删除（`target_gone`）；
+     - 共识地址不在本次候选中（`not_candidate`）。
+   - **即时生效、不回写**：共识历史每次实时读取，刚提交的复核下一次匹配
+     即可用；旧的匹配/复核记录一律不被修改。命中共识而自动确认的新记录
+     会在 `match_logs.consensus_json` 中保存当时的共识判定（含证据条数、
+     目标地址、原判原因）。
+   - **页面展示**：命中时结果卡片显示绿色「✅ 复核共识命中」横幅与
+     **证据条数**，共识候选带「共识指向」标记；未命中时以琥珀色横幅
+     说明原因（冲突/证据不足/目标失效/不在候选）。匹配结果 JSON 中对应
+     `consensus` 字段：
+
+   ```json
+   {
+     "status": "auto_matched",
+     "best_id": 5,
+     "consensus": {
+       "state": "hit",
+       "applied": true,
+       "target_id": 5,
+       "target": {"id": 5, "full_text": "1000 Lake Drive"},
+       "evidence_count": 2,
+       "rejected_count": 0,
+       "required": 2,
+       "original_status": "needs_review",
+       "original_reason": "最高得分低于自动确认阈值……",
+       "reason": "命中复核共识：2 条已复核记录一致确认标准地址 #5，自动指向该地址（原判：……）",
+       "evidence": [
+         {"match_id": 12, "action": "confirmed", "selected_id": 5, "reviewed_at": "…"}
+       ]
+     }
+   }
+   ```
+
 ---
 
 ## API 速览
@@ -219,8 +267,8 @@ curl -s -X POST http://localhost:8000/api/review-groups/review \
 | POST | `/api/addresses/preview` | 上传 CSV 生成预览凭证：有效/重复/无效数量 + 无效行号（不写入） |
 | POST | `/api/addresses/confirm` | 重新提交文件 + `preview_token`，事务内校验摘要/快照后仅写入有效记录 |
 | POST | `/api/addresses/load-sample` | 重新加载内置示例数据 |
-| POST | `/api/match` | 单条地址匹配 |
-| POST | `/api/match/batch` | 批量地址匹配 |
+| POST | `/api/match` | 单条地址匹配（评分后应用复核共识记忆，返回 `consensus` 判定） |
+| POST | `/api/match/batch` | 批量地址匹配（每条独立应用复核共识记忆） |
 | GET | `/api/matches?status=needs_review` | 匹配记录/待确认队列 |
 | GET | `/api/matches/{id}` | 单条匹配详情 |
 | POST | `/api/matches/{id}/review` | 单条复核：confirmed / overridden / rejected |
@@ -267,6 +315,7 @@ curl -s -X POST http://localhost:8000/api/review-groups/review \
 │   ├── db.py              # SQLite 表结构与读写
 │   ├── normalization.py   # Unicode/缩写/门牌号归一化与分词
 │   ├── matcher.py         # 词元与门牌号相似度、候选判定
+│   ├── consensus.py       # 复核共识记忆：历史复核聚合与自动指向
 │   ├── review_groups.py   # 同案合并复核：归组与整组事务写入
 │   ├── ingest.py          # CSV / JSON 标准地址导入
 │   ├── schemas.py         # Pydantic 模型

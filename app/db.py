@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS match_logs (
     matched_tokens   TEXT,                   -- JSON
     conflicts        TEXT,                   -- JSON
     candidates_json  TEXT NOT NULL,          -- JSON
+    consensus_json   TEXT,                   -- JSON: review-consensus verdict at match time
     created_at       TEXT NOT NULL,
     reviewed_at      TEXT,
     review_action    TEXT                   -- confirmed | overridden | rejected
@@ -85,6 +86,10 @@ def connect() -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # Lightweight migrations for databases created before the column existed.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(match_logs)")}
+    if "consensus_json" not in cols:
+        conn.execute("ALTER TABLE match_logs ADD COLUMN consensus_json TEXT")
     conn.commit()
 
 
@@ -254,13 +259,14 @@ def insert_match_log(conn: sqlite3.Connection, *, query: str, status: str,
                      token_score: float | None, house_score: float | None,
                      matched_tokens: list[dict[str, Any]],
                      conflicts: list[dict[str, Any]],
-                     candidates: list[dict[str, Any]]) -> int:
+                     candidates: list[dict[str, Any]],
+                     consensus: dict[str, Any] | None = None) -> int:
     cur = conn.execute(
         """
         INSERT INTO match_logs
             (query, status, score, candidate_id, token_score, house_score,
-             matched_tokens, conflicts, candidates_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             matched_tokens, conflicts, candidates_json, consensus_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             query,
@@ -272,6 +278,7 @@ def insert_match_log(conn: sqlite3.Connection, *, query: str, status: str,
             json.dumps(matched_tokens, ensure_ascii=False),
             json.dumps(conflicts, ensure_ascii=False),
             json.dumps(candidates, ensure_ascii=False),
+            json.dumps(consensus, ensure_ascii=False) if consensus else None,
             _now(),
         ),
     )

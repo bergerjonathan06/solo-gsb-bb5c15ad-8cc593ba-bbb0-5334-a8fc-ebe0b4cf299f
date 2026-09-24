@@ -160,6 +160,27 @@ button.reject { background: var(--red-bg); color: var(--red); }
 }
 .conflict b { color: var(--red); }
 
+/* review consensus memory */
+.consensus {
+    border-radius: 8px; padding: 8px 12px; margin: 8px 0 4px; font-size: 13px;
+}
+.consensus.hit {
+    border-left: 3px solid var(--green);
+    background: var(--green-bg); color: var(--green);
+}
+.consensus.blocked {
+    border-left: 3px solid var(--amber);
+    background: var(--amber-bg); color: var(--amber);
+}
+.consensus-badge { font-weight: 700; margin-right: 8px; }
+.consensus-meta b { color: var(--ink); }
+.consensus-reason { font-size: 12px; opacity: .85; margin-top: 2px; }
+.target-ribbon {
+    display: inline-block; margin-left: 8px; padding: 1px 8px;
+    border-radius: 999px; background: var(--green); color: #fff;
+    font-size: 11px; font-weight: 600; vertical-align: middle;
+}
+
 .table-wrap { overflow-x: auto; margin-top: 8px; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
